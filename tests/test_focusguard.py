@@ -131,9 +131,54 @@ class TestFocusGuard(unittest.TestCase):
         self.assertIn(b"SHOW", received[0])
         self.assertIn(b"OK", resp)
 
+    def test_boot_protection_config(self):
+        self.assertTrue(self.cm.config["settings"]["boot_protection"])
+        self.cm.config["settings"]["boot_protection"] = False
+        self.cm.save()
+
+        cm2 = ConfigManager(self.config_path)
+        self.assertFalse(cm2.config["settings"]["boot_protection"])
+
+    def test_autostart_command_format(self):
+        cmd = self.cm.get_autostart_command()
+        self.assertTrue(cmd.startswith('"'))
+        self.assertTrue(cmd.endswith('"'))
+        self.assertIn("focus_guard.pyw", cmd)
+        self.assertFalse(cmd.startswith('""'))
+
+    def test_hosts_block_verification(self):
+        from blocker import Blocker, BLOCK_START_MARKER, BLOCK_END_MARKER
+        b = Blocker()
+        # Test string parsing with temporary hosts content
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as tf:
+            tf.write("127.0.0.1 localhost\n")
+            temp_path = tf.name
+        
+        try:
+            # Point HOSTS_PATH to temp_path for testing
+            import blocker
+            orig_path = blocker.HOSTS_PATH
+            blocker.HOSTS_PATH = temp_path
+            
+            self.assertFalse(b.is_hosts_blocked())
+            
+            # Apply block
+            b.apply_hosts_block(["x.com"])
+            self.assertTrue(b.is_hosts_blocked())
+            self.assertTrue(b.is_hosts_blocked(["x.com"]))
+            
+            # Remove block
+            b.remove_hosts_block()
+            self.assertFalse(b.is_hosts_blocked())
+            
+            blocker.HOSTS_PATH = orig_path
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
     def test_version(self):
         from version import __version__
-        self.assertEqual(__version__, "1.1.0")
+        self.assertEqual(__version__, "1.2.0")
 
 if __name__ == "__main__":
     unittest.main()

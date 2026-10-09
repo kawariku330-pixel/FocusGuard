@@ -10,7 +10,7 @@ from tkinter import ttk, messagebox, simpledialog
 from PIL import Image, ImageDraw, ImageTk
 
 from config_manager import ConfigManager
-from blocker import Blocker, normalize_domain, expand_domains
+from blocker import Blocker, normalize_domain, expand_domains, request_hosts_write_permission
 from version import __version__
 
 IPC_PORT = 18990
@@ -61,12 +61,21 @@ class FocusGuardApp:
         self.cm = ConfigManager()
         self.blocker = Blocker()
 
+        # Synchronize Windows autostart configuration
+        self.cm.ensure_autostart_synced()
+
         self.running = True
         self.current_status_text = "待機中"
         self.is_currently_blocked = False
 
         self._setup_ui()
         self._setup_tray()
+
+        # Check if hosts write permission is needed for zero-gap protection
+        if not self.blocker.is_hosts_writable() and not self.cm.config.get("_hosts_notice_shown", False):
+            self.cm.config["_hosts_notice_shown"] = True
+            self.cm.save()
+            self.root.after(800, self._prompt_first_time_hosts_setup)
 
         # Handle window close (minimize to tray)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -547,14 +556,22 @@ class FocusGuardApp:
         frame = ttk.Frame(self.tab_settings, padding=15)
         frame.pack(fill="both", expand=True)
 
-        # Autostart
-        boot_box = ttk.LabelFrame(frame, text="🚀 スタートアップ設定", padding=15)
+        # Autostart & Boot Protection
+        boot_box = ttk.LabelFrame(frame, text="🚀 スタートアップ ＆ ゼロギャップ起動保護", padding=15)
         boot_box.pack(fill="x", pady=5)
 
         self.var_boot = tk.BooleanVar(value=self.cm.config["settings"].get("start_on_boot", True))
         chk_boot = ttk.Checkbutton(boot_box, text="Windows起動時に自動起動する（バックグラウンド常駐）", 
                                    variable=self.var_boot, command=self._on_boot_toggle)
         chk_boot.pack(anchor="w")
+
+        self.var_boot_protection = tk.BooleanVar(value=self.cm.config["settings"].get("boot_protection", True))
+        chk_boot_prot = ttk.Checkbutton(boot_box, text="🛡️ ゼロギャップ起動保護（PC起動直後も先行遮断を維持）", 
+                                        variable=self.var_boot_protection, command=self._on_boot_protection_toggle)
+        chk_boot_prot.pack(anchor="w", pady=(8, 2))
+
+        lbl_bp_desc = ttk.Label(boot_box, text="PC起動直後、アプリが立ち上がるまでの隙間時間に見れてしまうのを完全に防ぎます。\nhostsファイルにあらかじめ遮断設定を保持し、1秒の隙もない保護を提供します。", foreground="#555555")
+        lbl_bp_desc.pack(anchor="w", padx=(20, 0))
 
         # Security Password
         pass_box = ttk.LabelFrame(frame, text="🔒 解除防止パスワード", padding=15)
@@ -577,10 +594,9 @@ class FocusGuardApp:
         tech_box = ttk.LabelFrame(frame, text="🛡️ 通信遮断エンジンの状態", padding=15)
         tech_box.pack(fill="x", pady=10)
 
-        hosts_ok = self.blocker.is_hosts_writable()
-        status_h = "✅ hosts ファイル直接書込可能 (全通信・全ブラウザ完全遮断)" if hosts_ok else "⚠️ PAC プロキシ連携モードで稼働中 (管理者権限不要)"
-        self.lbl_tech_status = ttk.Label(tech_box, text=status_h, font=("Segoe UI", 10))
-        self.lbl_tech_status.pack(anchor="w")
+        self.frame_tech_inner = ttk.Frame(tech_box)
+        self.frame_tech_inner.pack(fill="x")
+        self._update_tech_status_ui()
 
         # App Info / Version
         info_box = ttk.LabelFrame(frame, text="ℹ️ バージョン情報", padding=15)
@@ -588,19 +604,86 @@ class FocusGuardApp:
         ttk.Label(info_box, text=f"FocusGuard  v{__version__}", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(info_box, text="特定サイト利用制限・集中力向上ツール (Windows)", font=("Segoe UI", 9), foreground="#666666").pack(anchor="w", pady=(2, 0))
 
+    def _update_tech_status_ui(self):
+        for widget in self.frame_tech_inner.winfo_children():
+            widget.destroy()
+
+        hosts_ok = self.blocker.is_hosts_writable()
+        if hosts_ok:
+            lbl = ttk.Label(self.frame_tech_inner, text="✅ hosts ファイル直接連携中 (全ブラウザ・PC起動直後の即時遮断が有効)", font=("Segoe UI", 10, "bold"), foreground="#28a745")
+            lbl.pack(anchor="w")
+            lbl_sub = ttk.Label(self.frame_tech_inner, text="OSレベルで完全遮断されているため、PC起動直後も隙間なく保護されます。", font=("Segoe UI", 9), foreground="#666666")
+            lbl_sub.pack(anchor="w", pady=(2, 0))
+        else:
+            lbl = ttk.Label(self.frame_tech_inner, text="⚠️ hosts ファイル書込権限なし (PACプロキシ限定モード)", font=("Segoe UI", 10, "bold"), foreground="#d9534f")
+            lbl.pack(anchor="w")
+            lbl_warn = ttk.Label(self.frame_tech_inner, text="※ PACプロキシモードでは、アプリ起動前の通信を遮断できません。\nPC起動直後から隙間なくブロックするには、下のボタンから hosts 権限を設定してください。", font=("Segoe UI", 9), foreground="#d9534f")
+            lbl_warn.pack(anchor="w", pady=(2, 6))
+
+            btn_elevate = ttk.Button(self.frame_tech_inner, text="⚡ 【推奨】ワンクリックで hosts 権限を設定 (管理者昇格)", command=self._request_hosts_permission)
+            btn_elevate.pack(anchor="w", pady=(2, 4))
+
+    def _request_hosts_permission(self):
+        ans = messagebox.askyesno(
+            "hosts 権限の設定",
+            "Windows の管理者権限確認（ユーザーアカウント制御）が表示されます。\n\n"
+            "「はい」をクリックすると、FocusGuard が Windows の hosts ファイルを直接変更できるようになり、\n"
+            "PC起動直後からのゼロギャップ遮断（隙間のない完全ブロック）が有効になります。\n\n"
+            "実行しますか？"
+        )
+        if not ans:
+            return
+
+        ok = request_hosts_write_permission()
+        self._update_tech_status_ui()
+        if ok:
+            messagebox.showinfo(
+                "設定完了",
+                "hosts ファイルへのアクセス権限を設定しました！\n\n"
+                "これでPC起動直後のゼロギャップ遮断が有効になりました。"
+            )
+            if self.is_currently_blocked:
+                sites = self.cm.config.get("blocked_sites", [])
+                use_hosts = self.cm.config.get("settings", {}).get("use_hosts", True)
+                use_pac = self.cm.config.get("settings", {}).get("use_pac", True)
+                self.blocker.block(sites, use_hosts=use_hosts, use_pac=use_pac)
+        else:
+            messagebox.showwarning(
+                "設定未完了",
+                "hosts ファイルの権限設定が完了しませんでした（キャンセルされたか失敗しました）。\n\n"
+                "フォルダー内の setup_hosts.bat を右クリックして「管理者として実行」することも可能です。"
+            )
+
+    def _prompt_first_time_hosts_setup(self):
+        ans = messagebox.askyesno(
+            "FocusGuard - ゼロギャップ起動保護のおすすめ",
+            "PC起動直後から1秒の隙間もなく指定サイトを遮断（ゼロギャップ保護）するには、\n"
+            "Windows の hosts ファイルへの権限設定が推奨されます。\n\n"
+            "今すぐワンクリックで hosts 権限を設定しますか？\n"
+            "（「はい」をクリックするとWindowsの許可画面（UAC）が表示されます）\n\n"
+            "※ 設定は後から「⚙️ 設定・セキュリティ」タブでもいつでも行えます。"
+        )
+        if ans:
+            self._request_hosts_permission()
+
     def _on_boot_toggle(self):
         val = self.var_boot.get()
         if not val and self.cm.has_password():
             if not self._prompt_password("自動起動をOFFにするにはパスワードを入力してください:"):
                 self.var_boot.set(True)
                 return
-        script_path = os.path.abspath(sys.argv[0])
-        # Use pythonw to launch silently on boot
-        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        if not os.path.exists(pythonw):
-            pythonw = sys.executable
-        cmd = f'"{pythonw}" "{script_path}"'
-        self.cm.set_autostart(val, exe_path=cmd)
+        self.cm.set_autostart(val)
+
+    def _on_boot_protection_toggle(self):
+        val = self.var_boot_protection.get()
+        if not val and self.cm.has_password():
+            if not self._prompt_password("ゼロギャップ起動保護をOFFにするにはパスワードを入力してください:"):
+                self.var_boot_protection.set(True)
+                return
+        self.cm.config["settings"]["boot_protection"] = val
+        self.cm.save()
+        if not val and not self.is_currently_blocked:
+            self.blocker.remove_hosts_block()
 
     def _change_password(self):
         if self.cm.has_password():
@@ -632,6 +715,8 @@ class FocusGuardApp:
                 return
         self.cm.config["enabled"] = self.var_master_enabled.get()
         self.cm.save()
+        if not self.var_master_enabled.get():
+            self.blocker.unblock()
 
     # --- QUICK FOCUS ACTIONS ---
     def start_quick_focus(self, minutes):
@@ -838,10 +923,24 @@ class FocusGuardApp:
                 return
 
         self.running = False
-        try:
-            self.blocker.unblock()
-        except Exception:
-            pass
+        boot_prot = self.cm.config.get("settings", {}).get("boot_protection", True)
+        master_enabled = self.cm.config.get("enabled", True)
+
+        # Only completely unblock if protection was explicitly disabled or boot_protection is turned off
+        if not master_enabled or not boot_prot:
+            try:
+                self.blocker.unblock()
+            except Exception:
+                pass
+        else:
+            # Maintain hosts block across restarts so PC boot cannot bypass it!
+            try:
+                self.blocker.pac_server.stop()
+                if self.blocker.is_hosts_writable():
+                    sites = self.cm.config.get("blocked_sites", [])
+                    self.blocker.apply_hosts_block(sites)
+            except Exception:
+                pass
 
         if hasattr(self, "tray_icon") and self.tray_icon:
             self.tray_icon.stop()
@@ -915,6 +1014,18 @@ def main():
             mutex_handle = acquire_single_instance_lock()
         else:
             sys.exit(0)
+
+    # Ensure autostart is active and zero-gap boot protection is immediately reinforced
+    try:
+        early_cm = ConfigManager()
+        early_cm.ensure_autostart_synced()
+        if early_cm.config.get("enabled", True) and early_cm.config.get("settings", {}).get("boot_protection", True):
+            early_blocker = Blocker()
+            if early_blocker.is_hosts_writable():
+                sites = early_cm.config.get("blocked_sites", [])
+                early_blocker.ensure_hosts_block(sites)
+    except Exception as e:
+        print(f"Error during early startup initialization: {e}")
 
     root = tk.Tk()
     app = FocusGuardApp(root)

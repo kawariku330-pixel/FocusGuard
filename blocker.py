@@ -36,6 +36,27 @@ def refresh_wininet():
     except Exception as e:
         print(f"Error refreshing WinINet: {e}")
 
+def request_hosts_write_permission():
+    """Requests administrator privilege via UAC to grant write permission on hosts file."""
+    try:
+        hosts_path = HOSTS_PATH
+        # Use powershell Start-Process with -Verb RunAs to invoke icacls with admin privileges
+        cmd = f'icacls "{hosts_path}" /grant Users:(M)'
+        ps_script = f"Start-Process cmd.exe -ArgumentList '/c {cmd}' -Verb RunAs -WindowStyle Hidden -Wait"
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            startupinfo=startupinfo,
+            timeout=30,
+            capture_output=True
+        )
+        b = Blocker()
+        return b.is_hosts_writable()
+    except Exception as e:
+        print(f"Error requesting hosts permission: {e}")
+        return False
+
 def normalize_domain(input_str):
     """Cleans up a domain or URL into a clean hostname."""
     s = input_str.strip().lower()
@@ -160,6 +181,32 @@ class Blocker:
             return True
         except Exception:
             return False
+
+    def is_hosts_blocked(self, domains=None):
+        """Checks if FocusGuard markers and domains are present in hosts file."""
+        if not os.path.exists(HOSTS_PATH):
+            return False
+        try:
+            with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if BLOCK_START_MARKER not in content or BLOCK_END_MARKER not in content:
+                return False
+            if domains:
+                for d in domains:
+                    if d.lower() not in content.lower():
+                        return False
+            return True
+        except Exception:
+            return False
+
+    def ensure_hosts_block(self, domain_list):
+        """Ensures hosts file contains the block rules (used for boot protection)."""
+        if not self.is_hosts_writable():
+            return False
+        expanded = expand_domains(domain_list)
+        if not self.is_hosts_blocked(expanded):
+            return self.apply_hosts_block(expanded)
+        return True
 
     def apply_hosts_block(self, domains):
         if not self.is_hosts_writable():

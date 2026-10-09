@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import hashlib
 import winreg
@@ -38,6 +39,7 @@ DEFAULT_CONFIG = {
     },
     "settings": {
         "start_on_boot": True,
+        "boot_protection": True,
         "use_hosts": True,
         "use_pac": True,
         "notifications": True
@@ -111,24 +113,93 @@ class ConfigManager:
     def has_password(self):
         return bool(self.config["security"].get("password_hash"))
 
-    # Autostart in registry
+    def get_autostart_command(self, script_path=None):
+        if not script_path:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            script_path = os.path.join(base_dir, "focus_guard.pyw")
+        
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+        return f'"{pythonw}" "{os.path.abspath(script_path)}"'
+
+    # Autostart in registry & Windows Startup folder
     def set_autostart(self, enable=True, exe_path=None):
         reg_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
         app_name = "FocusGuard"
+        
+        if enable:
+            if not exe_path:
+                exe_path = self.get_autostart_command()
+            else:
+                exe_path = exe_path.strip()
+                # Remove accidental nested outer quotes
+                if exe_path.startswith('""') and exe_path.endswith('""'):
+                    exe_path = exe_path[1:-1]
+        
+        # 1. Registry Run Key
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as key:
                 if enable:
-                    if not exe_path:
-                        exe_path = os.path.abspath(__file__)
-                    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}"')
+                    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
                 else:
                     try:
                         winreg.DeleteValue(key, app_name)
                     except FileNotFoundError:
                         pass
-            self.config["settings"]["start_on_boot"] = enable
-            self.save()
-            return True
         except Exception as e:
-            print(f"Error setting autostart: {e}")
-            return False
+            print(f"Error setting registry autostart: {e}")
+
+        # 2. Windows Startup folder backup (silent VBScript launcher)
+        try:
+            startup_dir = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup")
+            if os.path.exists(startup_dir):
+                vbs_path = os.path.join(startup_dir, "FocusGuard.vbs")
+                if enable:
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                    main_pyw = os.path.join(base_dir, "focus_guard.pyw")
+                    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                    if not os.path.exists(pythonw):
+                        pythonw = sys.executable
+                    vbs_content = (
+                        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+                        f'WshShell.Run """{pythonw}"" ""{main_pyw}""", 0, False\r\n'
+                    )
+                    with open(vbs_path, "w", encoding="utf-8") as f:
+                        f.write(vbs_content)
+                else:
+                    if os.path.exists(vbs_path):
+                        try:
+                            os.remove(vbs_path)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"Error updating startup folder: {e}")
+
+        self.config["settings"]["start_on_boot"] = enable
+        self.save()
+        return True
+
+    def is_autostart_enabled(self):
+        reg_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "FocusGuard"
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_READ) as key:
+                val, _ = winreg.QueryValueEx(key, app_name)
+                if val:
+                    return True
+        except Exception:
+            pass
+        startup_dir = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup")
+        vbs_path = os.path.join(startup_dir, "FocusGuard.vbs")
+        return os.path.exists(vbs_path)
+
+    def ensure_autostart_synced(self):
+        """Ensures autostart on Windows matches configuration (called on startup)."""
+        should_start = self.config.get("settings", {}).get("start_on_boot", True)
+        if should_start:
+            if not self.is_autostart_enabled():
+                self.set_autostart(True)
+        else:
+            if self.is_autostart_enabled():
+                self.set_autostart(False)
