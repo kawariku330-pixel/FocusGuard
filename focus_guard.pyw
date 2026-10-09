@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 from config_manager import ConfigManager
 from blocker import Blocker, normalize_domain, expand_domains
+from version import __version__
 
 IPC_PORT = 18990
 
@@ -49,7 +50,7 @@ def create_icon_image(is_blocked=False):
 class FocusGuardApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("FocusGuard - 特定サイト利用制限")
+        self.root.title(f"FocusGuard v{__version__} - 特定サイト利用制限")
         self.root.geometry("640x560")
         self.root.minsize(580, 500)
 
@@ -581,6 +582,12 @@ class FocusGuardApp:
         self.lbl_tech_status = ttk.Label(tech_box, text=status_h, font=("Segoe UI", 10))
         self.lbl_tech_status.pack(anchor="w")
 
+        # App Info / Version
+        info_box = ttk.LabelFrame(frame, text="ℹ️ バージョン情報", padding=15)
+        info_box.pack(fill="x", pady=5)
+        ttk.Label(info_box, text=f"FocusGuard  v{__version__}", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(info_box, text="特定サイト利用制限・集中力向上ツール (Windows)", font=("Segoe UI", 9), foreground="#666666").pack(anchor="w", pady=(2, 0))
+
     def _on_boot_toggle(self):
         val = self.var_boot.get()
         if not val and self.cm.has_password():
@@ -759,7 +766,7 @@ class FocusGuardApp:
             from pystray import MenuItem as item
 
             menu = (
-                item("⚙️ 設定画面を開く", self.show_window, default=True),
+                item(f"⚙️ 設定画面を開く (v{__version__})", self.show_window, default=True),
                 item("⚡ クイック集中 (25分)", lambda: self.start_quick_focus(25)),
                 item("🔓 集中解除", self.stop_quick_focus),
                 pystray.Menu.SEPARATOR,

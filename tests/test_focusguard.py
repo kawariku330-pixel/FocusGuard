@@ -131,5 +131,9 @@ class TestFocusGuard(unittest.TestCase):
         self.assertIn(b"SHOW", received[0])
         self.assertIn(b"OK", resp)
 
+    def test_version(self):
+        from version import __version__
+        self.assertEqual(__version__, "1.1.0")
+
 if __name__ == "__main__":
     unittest.main()
