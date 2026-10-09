@@ -55,5 +55,81 @@ class TestFocusGuard(unittest.TestCase):
         self.assertIn("twitter.com", expanded)
         self.assertIn("api.x.com", expanded)
 
+    def test_schedule_modification(self):
+        self.cm.config["schedule"]["enabled"] = False
+        self.cm.config["schedule"]["start_time"] = "10:00"
+        self.cm.config["schedule"]["end_time"] = "19:00"
+        self.cm.config["schedule"]["days"] = [0, 2, 4]
+        self.cm.save()
+
+        cm2 = ConfigManager(self.config_path)
+        self.assertFalse(cm2.config["schedule"]["enabled"])
+        self.assertEqual(cm2.config["schedule"]["start_time"], "10:00")
+        self.assertEqual(cm2.config["schedule"]["end_time"], "19:00")
+        self.assertEqual(cm2.config["schedule"]["days"], [0, 2, 4])
+
+    def test_blocked_sites_add_and_remove(self):
+        sites = self.cm.config["blocked_sites"]
+        # Add site
+        new_site = "reddit.com"
+        if new_site not in sites:
+            sites.append(new_site)
+        self.cm.save()
+
+        cm2 = ConfigManager(self.config_path)
+        self.assertIn("reddit.com", cm2.config["blocked_sites"])
+
+        # Remove site
+        cm2.config["blocked_sites"].remove("reddit.com")
+        cm2.save()
+
+        cm3 = ConfigManager(self.config_path)
+        self.assertNotIn("reddit.com", cm3.config["blocked_sites"])
+
+    def test_timer_configuration(self):
+        self.cm.config["timer"]["enabled"] = True
+        self.cm.config["timer"]["daily_limit_minutes"] = 45
+        self.cm.config["timer"]["spent_seconds_today"] = 120
+        self.cm.save()
+
+        cm2 = ConfigManager(self.config_path)
+        self.assertTrue(cm2.config["timer"]["enabled"])
+        self.assertEqual(cm2.config["timer"]["daily_limit_minutes"], 45)
+        self.assertEqual(cm2.config["timer"]["spent_seconds_today"], 120)
+
+    def test_ipc_show_signal(self):
+        import socket
+        import threading
+        test_port = 18991
+        received = []
+
+        def dummy_server():
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", test_port))
+            s.listen(1)
+            conn, _ = s.accept()
+            msg = conn.recv(1024)
+            received.append(msg)
+            conn.sendall(b"OK\n")
+            conn.close()
+            s.close()
+
+        t = threading.Thread(target=dummy_server)
+        t.start()
+
+        import time
+        time.sleep(0.1)
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.connect(("127.0.0.1", test_port))
+        client.sendall(b"SHOW\n")
+        resp = client.recv(1024)
+        client.close()
+        t.join()
+
+        self.assertIn(b"SHOW", received[0])
+        self.assertIn(b"OK", resp)
+
 if __name__ == "__main__":
     unittest.main()

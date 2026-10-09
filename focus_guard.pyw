@@ -1,14 +1,18 @@
 import os
 import sys
 import time
+import socket
+import ctypes
 import threading
 from datetime import datetime, date, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 
 from config_manager import ConfigManager
-from blocker import Blocker, normalize_domain
+from blocker import Blocker, normalize_domain, expand_domains
+
+IPC_PORT = 18990
 
 # Generate dynamic tray icon images using Pillow
 def create_icon_image(is_blocked=False):
@@ -66,16 +70,59 @@ class FocusGuardApp:
         # Handle window close (minimize to tray)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
+        # Start IPC server to allow subsequent launches to bring window to front
+        self._start_ipc_server()
+
         # Start monitoring background thread
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
 
+    def _start_ipc_server(self):
+        def _ipc_worker():
+            try:
+                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                bound = False
+                for _ in range(5):
+                    try:
+                        server.bind(("127.0.0.1", IPC_PORT))
+                        bound = True
+                        break
+                    except Exception:
+                        time.sleep(0.5)
+                if not bound:
+                    print("Could not bind IPC port, existing instance may be active.")
+                    return
+
+                server.listen(5)
+                while self.running:
+                    try:
+                        client, _ = server.accept()
+                        data = client.recv(1024)
+                        if b"SHOW" in data or b"PING" in data:
+                            self.show_window()
+                            client.sendall(b"OK\n")
+                        client.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"IPC server error: {e}")
+        threading.Thread(target=_ipc_worker, daemon=True).start()
+
     def _setup_ui(self):
         style = ttk.Style()
         try:
-            style.theme_use("clam")
+            if "vista" in style.theme_names():
+                style.theme_use("vista")
+            elif "xpnative" in style.theme_names():
+                style.theme_use("xpnative")
+            elif "winnative" in style.theme_names():
+                style.theme_use("winnative")
         except Exception:
             pass
+
+        # Configure checkmark (✓) for all checkboxes
+        self._setup_checkbox_style(style)
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -95,6 +142,93 @@ class FocusGuardApp:
         self._build_sites_tab()
         self._build_schedule_tab()
         self._build_settings_tab()
+
+    def _setup_checkbox_style(self, style):
+        try:
+            box_size = 18
+            pad_r = 6
+            w, h = box_size + pad_r, box_size
+
+            def make_img(fill, outline, checked=False, ck_color='#ffffff'):
+                im = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+                d = ImageDraw.Draw(im)
+                d.rounded_rectangle([1, 1, box_size - 2, box_size - 2], radius=3, fill=fill, outline=outline, width=1)
+                if checked:
+                    # Draw checkmark ✓
+                    d.line([(4, 9), (7, 13), (14, 5)], fill=ck_color, width=2)
+                    d.ellipse([6, 12, 8, 14], fill=ck_color)
+                return ImageTk.PhotoImage(im)
+
+            un = make_img('#ffffff', '#737373', False)
+            un_h = make_img('#f5f5f5', '#1976d2', False)
+            un_d = make_img('#f0f0f0', '#cccccc', False)
+
+            ck = make_img('#1976d2', '#1565c0', True, '#ffffff')
+            ck_h = make_img('#1565c0', '#0d47a1', True, '#ffffff')
+            ck_d = make_img('#b0bec5', '#90a4ae', True, '#ffffff')
+
+            self._cb_images = (un, un_h, un_d, ck, ck_h, ck_d)
+
+            style.element_create('Custom.indicator', 'image', un,
+                                 ('disabled', 'selected', ck_d),
+                                 ('disabled', un_d),
+                                 ('selected', 'active', ck_h),
+                                 ('selected', ck),
+                                 ('active', un_h))
+
+            style.layout('TCheckbutton', [
+                ('Checkbutton.padding', {'sticky': 'nswe', 'children': [
+                    ('Custom.indicator', {'side': 'left', 'sticky': ''}),
+                    ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
+                        ('Checkbutton.label', {'sticky': 'nswe'})
+                    ]})
+                ]})
+            ])
+        except Exception as e:
+            print(f"Failed to setup custom checkbox style: {e}")
+
+    # --- PASSWORD & VALIDATION HELPERS ---
+    def _prompt_password(self, prompt="設定を変更するにはパスワードを入力してください:"):
+        if not self.cm.has_password():
+            return True
+        pwd = simpledialog.askstring("認証", prompt, show="*")
+        if pwd is None:
+            return False
+        if not self.cm.check_password(pwd):
+            messagebox.showerror("エラー", "パスワードが正しくありません。")
+            return False
+        return True
+
+    def _validate_time_str(self, time_str):
+        try:
+            datetime.strptime(time_str.strip(), "%H:%M")
+            return True
+        except ValueError:
+            return False
+
+    def _sync_schedule_ui_from_config(self):
+        sched = self.cm.config.get("schedule", {})
+        self.var_sched_enabled.set(sched.get("enabled", True))
+        self.entry_start_time.delete(0, tk.END)
+        self.entry_start_time.insert(0, sched.get("start_time", "09:00"))
+        self.entry_end_time.delete(0, tk.END)
+        self.entry_end_time.insert(0, sched.get("end_time", "18:00"))
+        active_days = sched.get("days", [0, 1, 2, 3, 4])
+        for i, v in enumerate(self.day_vars):
+            v.set(i in active_days)
+
+    def _update_password_status_ui(self):
+        if hasattr(self, "lbl_pass_status"):
+            if self.cm.has_password():
+                self.lbl_pass_status.config(
+                    text="🔒 パスワード保護: 有効（時間帯制限の変更やサイト削除が保護されています）",
+                    fg="#28a745"
+                )
+            else:
+                self.lbl_pass_status.config(
+                    text="🔓 パスワード保護: 未設定（誰でも設定を変更できます）",
+                    fg="#6c757d"
+                )
 
     # --- TAB 1: HOME ---
     def _build_home_tab(self):
@@ -152,7 +286,7 @@ class FocusGuardApp:
         frame = ttk.Frame(self.tab_sites, padding=15)
         frame.pack(fill="both", expand=True)
 
-        desc = ttk.Label(frame, text="ブロックするWebサイトのドメイン（例: x.com, youtube.com）を指定します。\nx.com を指定すると、twitter.com や関連サブドメインも自動的に網羅されます。")
+        desc = ttk.Label(frame, text="ブロックするWebサイトのドメイン（例: x.com, youtube.com）を指定します。\nx.com を指定すると、twitter.com や関連サブドメインも自動的に網羅されます。\n※ サイトの追加は自由に行えますが、削除・初期化にはパスワードが必要です。")
         desc.pack(anchor="w", pady=(0, 10))
 
         # List frame
@@ -199,6 +333,7 @@ class FocusGuardApp:
             self.cm.save()
             self._refresh_site_list()
             self.entry_new_site.delete(0, tk.END)
+            self._check_and_update_block_state()
 
     def _remove_site(self):
         sel = self.site_listbox.curselection()
@@ -207,15 +342,26 @@ class FocusGuardApp:
         idx = sel[0]
         sites = self.cm.config.get("blocked_sites", [])
         if 0 <= idx < len(sites):
+            target_site = sites[idx]
+            if self.cm.has_password():
+                if not self._prompt_password(f"「{target_site}」をブロック対象から削除するにはパスワードを入力してください:"):
+                    return
             del sites[idx]
             self.cm.save()
             self._refresh_site_list()
+            self._check_and_update_block_state()
+            messagebox.showinfo("成功", f"「{target_site}」をブロック対象から削除しました。")
 
     def _reset_default_sites(self):
+        if self.cm.has_password():
+            if not self._prompt_password("ブロック対象サイトを初期設定に戻すにはパスワードを入力してください:"):
+                return
         if messagebox.askyesno("確認", "ブロック対象サイトを初期設定（X / Twitter）に戻しますか？"):
             self.cm.config["blocked_sites"] = ["x.com", "twitter.com", "api.x.com", "api.twitter.com"]
             self.cm.save()
             self._refresh_site_list()
+            self._check_and_update_block_state()
+            messagebox.showinfo("成功", "初期設定に戻しました。")
 
     # --- TAB 3: SCHEDULE & TIMER ---
     def _build_schedule_tab(self):
@@ -226,8 +372,10 @@ class FocusGuardApp:
         sched_box = ttk.LabelFrame(frame, text="⏰ 時間帯制限（スケジュール）", padding=15)
         sched_box.pack(fill="x", pady=5)
 
+        ttk.Label(sched_box, text="※ パスワード設定時は、時間帯制限の変更（ON/OFF・時間・曜日）にパスワードが必要です。", font=("Segoe UI", 9), foreground="#555555").pack(anchor="w", pady=(0, 6))
+
         self.var_sched_enabled = tk.BooleanVar(value=self.cm.config["schedule"].get("enabled", True))
-        chk_sched = ttk.Checkbutton(sched_box, text="時間帯制限を有効にする", variable=self.var_sched_enabled, command=self._save_schedule_config)
+        chk_sched = ttk.Checkbutton(sched_box, text="時間帯制限を有効にする", variable=self.var_sched_enabled, command=self._on_sched_toggle)
         chk_sched.pack(anchor="w", pady=(0, 8))
 
         time_row = ttk.Frame(sched_box)
@@ -263,7 +411,7 @@ class FocusGuardApp:
         for i, name in enumerate(day_names):
             v = tk.BooleanVar(value=(i in active_days))
             self.day_vars.append(v)
-            ttk.Checkbutton(days_box, text=name, variable=v, command=self._save_schedule_config).pack(side="left", padx=3)
+            ttk.Checkbutton(days_box, text=name, variable=v, command=lambda idx=i: self._on_day_toggle(idx)).pack(side="left", padx=3)
 
         # Daily Timer Limit Section
         timer_box = ttk.LabelFrame(frame, text="⏳ 1日の利用時間上限（タイマー制限）", padding=15)
@@ -271,7 +419,7 @@ class FocusGuardApp:
 
         self.var_timer_enabled = tk.BooleanVar(value=self.cm.config["timer"].get("enabled", False))
         chk_timer = ttk.Checkbutton(timer_box, text="1日の利用時間上限を有効にする（指定時間を使用したら当日はブロック）", 
-                                    variable=self.var_timer_enabled, command=self._save_timer_config)
+                                    variable=self.var_timer_enabled, command=self._on_timer_toggle)
         chk_timer.pack(anchor="w", pady=(0, 8))
 
         timer_row = ttk.Frame(timer_box)
@@ -285,32 +433,110 @@ class FocusGuardApp:
         ttk.Button(timer_row, text="保存", command=self._save_timer_config).pack(side="left", padx=4)
         ttk.Button(timer_row, text="本日の利用時間をリセット", command=self._reset_today_timer).pack(side="left", padx=4)
 
+    def _on_sched_toggle(self):
+        if self.cm.has_password():
+            if not self._prompt_password("時間帯制限を切り替えるにはパスワードを入力してください:"):
+                self.var_sched_enabled.set(self.cm.config["schedule"].get("enabled", True))
+                return
+        self.cm.config["schedule"]["enabled"] = self.var_sched_enabled.get()
+        self.cm.save()
+
+    def _on_day_toggle(self, idx):
+        if self.cm.has_password():
+            if not self._prompt_password("適用曜日を変更するにはパスワードを入力してください:"):
+                saved_days = self.cm.config["schedule"].get("days", [0, 1, 2, 3, 4])
+                self.day_vars[idx].set(idx in saved_days)
+                return
+        self.cm.config["schedule"]["days"] = [i for i, v in enumerate(self.day_vars) if v.get()]
+        self.cm.save()
+
     def _set_preset(self, start, end):
+        if self.cm.has_password():
+            if not self._prompt_password("プリセットを適用するにはパスワードを入力してください:"):
+                return
         self.entry_start_time.delete(0, tk.END)
         self.entry_start_time.insert(0, start)
         self.entry_end_time.delete(0, tk.END)
         self.entry_end_time.insert(0, end)
-        self._save_schedule_config()
+        self.cm.config["schedule"]["start_time"] = start
+        self.cm.config["schedule"]["end_time"] = end
+        self.cm.save()
+        messagebox.showinfo("成功", f"プリセット ({start}〜{end}) を適用・保存しました。")
 
     def _save_schedule_config(self):
         s = self.entry_start_time.get().strip()
         e = self.entry_end_time.get().strip()
-        self.cm.config["schedule"]["enabled"] = self.var_sched_enabled.get()
-        self.cm.config["schedule"]["start_time"] = s
-        self.cm.config["schedule"]["end_time"] = e
-        self.cm.config["schedule"]["days"] = [i for i, v in enumerate(self.day_vars) if v.get()]
+
+        if not self._validate_time_str(s) or not self._validate_time_str(e):
+            messagebox.showerror("エラー", "時間の形式が正しくありません。\n例: 09:00, 18:00 (半角数字・コロン)")
+            return
+
+        sched = self.cm.config["schedule"]
+        current_days = [i for i, v in enumerate(self.day_vars) if v.get()]
+        is_changed = (
+            s != sched.get("start_time") or
+            e != sched.get("end_time") or
+            self.var_sched_enabled.get() != sched.get("enabled", True) or
+            current_days != sched.get("days", [])
+        )
+        if not is_changed:
+            messagebox.showinfo("情報", "設定に変更はありません。")
+            return
+
+        if self.cm.has_password():
+            if not self._prompt_password("時間帯制限の設定を変更するにはパスワードを入力してください:"):
+                self._sync_schedule_ui_from_config()
+                return
+
+        sched["enabled"] = self.var_sched_enabled.get()
+        sched["start_time"] = s
+        sched["end_time"] = e
+        sched["days"] = current_days
+        self.cm.save()
+        messagebox.showinfo("成功", "時間帯制限の設定を保存しました。")
+
+    def _on_timer_toggle(self):
+        if self.cm.has_password():
+            if not self._prompt_password("タイマー制限を切り替えるにはパスワードを入力してください:"):
+                self.var_timer_enabled.set(self.cm.config["timer"].get("enabled", False))
+                return
+        self.cm.config["timer"]["enabled"] = self.var_timer_enabled.get()
         self.cm.save()
 
     def _save_timer_config(self):
         try:
             val = int(self.entry_timer_limit.get().strip())
-            self.cm.config["timer"]["daily_limit_minutes"] = max(1, val)
         except ValueError:
-            pass
-        self.cm.config["timer"]["enabled"] = self.var_timer_enabled.get()
+            messagebox.showerror("エラー", "正の整数（分）を入力してください。")
+            return
+
+        if val < 1:
+            messagebox.showerror("エラー", "1分以上を指定してください。")
+            return
+
+        timer_cfg = self.cm.config["timer"]
+        is_changed = (val != timer_cfg.get("daily_limit_minutes") or
+                      self.var_timer_enabled.get() != timer_cfg.get("enabled", False))
+        if not is_changed:
+            messagebox.showinfo("情報", "設定に変更はありません。")
+            return
+
+        if self.cm.has_password():
+            if not self._prompt_password("タイマー制限の設定を変更するにはパスワードを入力してください:"):
+                self.var_timer_enabled.set(timer_cfg.get("enabled", False))
+                self.entry_timer_limit.delete(0, tk.END)
+                self.entry_timer_limit.insert(0, str(timer_cfg.get("daily_limit_minutes", 30)))
+                return
+
+        timer_cfg["daily_limit_minutes"] = val
+        timer_cfg["enabled"] = self.var_timer_enabled.get()
         self.cm.save()
+        messagebox.showinfo("成功", "タイマー設定を保存しました。")
 
     def _reset_today_timer(self):
+        if self.cm.has_password():
+            if not self._prompt_password("本日の利用時間をリセットするにはパスワードを入力してください:"):
+                return
         self.cm.config["timer"]["spent_seconds_today"] = 0
         self.cm.save()
         messagebox.showinfo("完了", "本日の利用時間カウントをゼロにリセットしました。")
@@ -333,8 +559,12 @@ class FocusGuardApp:
         pass_box = ttk.LabelFrame(frame, text="🔒 解除防止パスワード", padding=15)
         pass_box.pack(fill="x", pady=10)
 
-        pass_desc = ttk.Label(pass_box, text="意思の弱さで勝手に解除してしまうのを防ぐため、設定変更や制限解除にパスワードを要求できます。")
-        pass_desc.pack(anchor="w", pady=(0, 8))
+        pass_desc = ttk.Label(pass_box, text="意思の弱さで勝手に解除してしまうのを防ぐため、時間帯制限の変更やサイト削除、制限解除にパスワードを要求します。")
+        pass_desc.pack(anchor="w", pady=(0, 6))
+
+        self.lbl_pass_status = tk.Label(pass_box, text="", font=("Segoe UI", 9, "bold"))
+        self.lbl_pass_status.pack(anchor="w", pady=(0, 8))
+        self._update_password_status_ui()
 
         btn_pass_row = ttk.Frame(pass_box)
         btn_pass_row.pack(fill="x")
@@ -353,6 +583,10 @@ class FocusGuardApp:
 
     def _on_boot_toggle(self):
         val = self.var_boot.get()
+        if not val and self.cm.has_password():
+            if not self._prompt_password("自動起動をOFFにするにはパスワードを入力してください:"):
+                self.var_boot.set(True)
+                return
         script_path = os.path.abspath(sys.argv[0])
         # Use pythonw to launch silently on boot
         pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -363,31 +597,30 @@ class FocusGuardApp:
 
     def _change_password(self):
         if self.cm.has_password():
-            curr = simpledialog.askstring("認証", "現在のパスワードを入力してください:", show="*")
-            if not curr or not self.cm.check_password(curr):
-                messagebox.showerror("エラー", "パスワードが正しくありません。")
+            if not self._prompt_password("現在のパスワードを入力してください:"):
                 return
         new_pass = simpledialog.askstring("設定", "新しいパスワードを入力してください:", show="*")
-        if new_pass:
-            self.cm.set_password(new_pass)
+        if new_pass is not None:
+            if not new_pass.strip():
+                messagebox.showwarning("警告", "パスワードが空です。解除する場合は「パスワードを解除」ボタンを使用してください。")
+                return
+            self.cm.set_password(new_pass.strip())
+            self._update_password_status_ui()
             messagebox.showinfo("成功", "パスワードを設定しました。")
 
     def _remove_password(self):
         if not self.cm.has_password():
             messagebox.showinfo("情報", "パスワードは設定されていません。")
             return
-        curr = simpledialog.askstring("認証", "現在のパスワードを入力してください:", show="*")
-        if curr and self.cm.check_password(curr):
-            self.cm.set_password("")
-            messagebox.showinfo("成功", "パスワードを解除しました。")
-        else:
-            messagebox.showerror("エラー", "パスワードが正しくありません。")
+        if not self._prompt_password("パスワードを解除するには現在のパスワードを入力してください:"):
+            return
+        self.cm.set_password("")
+        self._update_password_status_ui()
+        messagebox.showinfo("成功", "パスワードを解除しました。")
 
     def _on_master_toggle(self):
         if not self.var_master_enabled.get() and self.cm.has_password():
-            pwd = simpledialog.askstring("認証", "保護機能をOFFにするにはパスワードを入力してください:", show="*")
-            if not pwd or not self.cm.check_password(pwd):
-                messagebox.showerror("エラー", "パスワードが一致しません。")
+            if not self._prompt_password("保護機能をOFFにするにはパスワードを入力してください:"):
                 self.var_master_enabled.set(True)
                 return
         self.cm.config["enabled"] = self.var_master_enabled.get()
@@ -403,9 +636,7 @@ class FocusGuardApp:
 
     def stop_quick_focus(self):
         if self.cm.has_password():
-            pwd = simpledialog.askstring("認証", "集中モードを解除するにはパスワードを入力してください:", show="*")
-            if not pwd or not self.cm.check_password(pwd):
-                messagebox.showerror("エラー", "パスワードが正しくありません。")
+            if not self._prompt_password("集中モードを解除するにはパスワードを入力してください:"):
                 return
         self.cm.config["quick_focus"]["active"] = False
         self.cm.config["quick_focus"]["until_timestamp"] = 0
@@ -474,10 +705,11 @@ class FocusGuardApp:
 
         # Apply state to blocker
         if should_block:
-            if not self.blocker.is_blocking:
-                sites = cfg.get("blocked_sites", [])
-                use_hosts = cfg.get("settings", {}).get("use_hosts", True)
-                use_pac = cfg.get("settings", {}).get("use_pac", True)
+            sites = cfg.get("blocked_sites", [])
+            use_hosts = cfg.get("settings", {}).get("use_hosts", True)
+            use_pac = cfg.get("settings", {}).get("use_pac", True)
+            expanded = expand_domains(sites)
+            if not self.blocker.is_blocking or set(self.blocker.current_blocked_domains) != set(expanded):
                 self.blocker.block(sites, use_hosts=use_hosts, use_pac=use_pac)
             self.is_currently_blocked = True
         else:
@@ -545,19 +777,57 @@ class FocusGuardApp:
             print(f"Failed to initialize pystray: {e}")
             self.tray_icon = None
 
-    def show_window(self):
-        self.root.deiconify()
+    def show_window(self, icon=None, item=None):
+        self.root.after(0, self._bring_window_to_front)
+
+    def _bring_window_to_front(self):
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            hwnd = int(self.root.wm_frame(), 16)
+            if hwnd:
+                user32 = ctypes.windll.user32
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                fg_hwnd = user32.GetForegroundWindow()
+                fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
+                cur_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+                if fg_thread != 0 and fg_thread != cur_thread:
+                    user32.AttachThreadInput(cur_thread, fg_thread, True)
+                    user32.SetForegroundWindow(hwnd)
+                    user32.BringWindowToTop(hwnd)
+                    user32.AttachThreadInput(cur_thread, fg_thread, False)
+                else:
+                    user32.SetForegroundWindow(hwnd)
+                    user32.BringWindowToTop(hwnd)
+        except Exception as e:
+            print(f"Error restoring window: {e}")
+
         self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(150, self._remove_topmost)
         self.root.focus_force()
+
+    def _remove_topmost(self):
+        try:
+            self.root.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def hide_window(self):
         self.root.withdraw()
+        if hasattr(self, "tray_icon") and self.tray_icon:
+            try:
+                self.tray_icon.notify(
+                    "FocusGuard はタスクトレイで常駐監視中です。\n再度開くには run.bat を実行するか、トレイアイコンをクリックしてください。",
+                    "FocusGuard 最小化"
+                )
+            except Exception:
+                pass
 
     def quit_app(self):
         if self.cm.has_password():
-            pwd = simpledialog.askstring("認証", "FocusGuardを終了するにはパスワードを入力してください:", show="*")
-            if not pwd or not self.cm.check_password(pwd):
-                messagebox.showerror("エラー", "パスワードが正しくありません。")
+            if not self._prompt_password("FocusGuardを終了するにはパスワードを入力してください:"):
                 return
 
         self.running = False
@@ -572,9 +842,79 @@ class FocusGuardApp:
         self.root.destroy()
         sys.exit(0)
 
+_single_instance_mutex_handle = None
+
+def try_signal_existing_instance():
+    try:
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except Exception:
+            pass
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.2)
+        s.connect(("127.0.0.1", IPC_PORT))
+        s.sendall(b"SHOW\n")
+        resp = s.recv(1024)
+        s.close()
+        return b"OK" in resp
+    except Exception:
+        return False
+
+def acquire_single_instance_lock():
+    global _single_instance_mutex_handle
+    mutex_name = "Local\\FocusGuard_SingleInstance_Mutex_App"
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+    last_error = ctypes.windll.kernel32.GetLastError()
+    ERROR_ALREADY_EXISTS = 183
+    if last_error == ERROR_ALREADY_EXISTS:
+        return None
+    _single_instance_mutex_handle = handle
+    return handle
+
+def kill_other_focusguard_instances():
+    my_pid = os.getpid()
+    try:
+        import subprocess
+        # Terminate any process holding IPC_PORT
+        s_cmd = f"(Get-NetTCPConnection -LocalPort {IPC_PORT} -ErrorAction SilentlyContinue).OwningProcess | Where-Object {{ $_ -ne {my_pid} -and $_ -gt 0 }} | ForEach-Object {{ Stop-Process -Id $_ -Force }}"
+        subprocess.run(["powershell", "-NoProfile", "-Command", s_cmd], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
 def main():
+    # If already running, signal existing instance to show its window and exit
+    if try_signal_existing_instance():
+        sys.exit(0)
+
+    mutex_handle = acquire_single_instance_lock()
+    if mutex_handle is None:
+        time.sleep(0.5)
+        if try_signal_existing_instance():
+            sys.exit(0)
+
+        # Mutex exists but IPC does not respond
+        root = tk.Tk()
+        root.withdraw()
+        ans = messagebox.askyesno(
+            "FocusGuard",
+            "FocusGuard は既に起動しているか、前回のプロセスが終了していません。\n\n"
+            "画面右下のタスクトレイにアイコンが見当たらない場合、前回のプロセスが停止している可能性があります。\n\n"
+            "前回のプロセスを終了して、FocusGuard を新しく起動しますか？"
+        )
+        root.destroy()
+        if ans:
+            kill_other_focusguard_instances()
+            time.sleep(0.8)
+            mutex_handle = acquire_single_instance_lock()
+        else:
+            sys.exit(0)
+
     root = tk.Tk()
     app = FocusGuardApp(root)
+    root.deiconify()
+    root.state("normal")
+    root.lift()
+    root.focus_force()
     root.mainloop()
 
 if __name__ == "__main__":

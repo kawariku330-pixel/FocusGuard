@@ -72,24 +72,30 @@ def expand_domains(domain_list):
             expanded.add("mobile.x.com")
     return sorted(list(expanded))
 
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
 class PACRequestHandler(BaseHTTPRequestHandler):
     blocked_domains = []
 
     def do_GET(self):
-        if self.path == "/proxy.pac":
+        if self.path == "/proxy.pac" or self.path.startswith("/proxy.pac?"):
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ns-proxy-autoconfig")
-            self.send_header("Cache-Control", "no-cache, must-revalidate")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.end_headers()
             
-            domains_js = ",\n    ".join([f'"{d}"' for d in PACRequestHandler.blocked_domains])
+            domains_js = ",\n    ".join([f'"{d.lower()}"' for d in PACRequestHandler.blocked_domains])
             pac_script = f"""function FindProxyForURL(url, host) {{
+    var h = (host || "").toLowerCase();
     var blocked = [
     {domains_js}
     ];
     for (var i = 0; i < blocked.length; i++) {{
-        var d = blocked[i];
-        if (dnsDomainIs(host, d) || host === d || shExpMatch(host, "*." + d)) {{
+        var d = blocked[i].toLowerCase();
+        if (h === d || h.endsWith("." + d) || dnsDomainIs(h, d) || dnsDomainIs(h, "." + d) || shExpMatch(h, "*." + d)) {{
             return "PROXY 127.0.0.1:0";
         }}
     }}
@@ -116,13 +122,16 @@ class PACServer:
         PACRequestHandler.blocked_domains = blocked_domains
         if self.is_running:
             return
-        try:
-            self.server = HTTPServer(("127.0.0.1", self.port), PACRequestHandler)
-            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-            self.thread.start()
-            self.is_running = True
-        except Exception as e:
-            print(f"Failed to start PAC server: {e}")
+        for attempt in range(5):
+            try:
+                self.server = ReusableHTTPServer(("127.0.0.1", self.port), PACRequestHandler)
+                self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+                self.thread.start()
+                self.is_running = True
+                return
+            except Exception as e:
+                time.sleep(0.5)
+        print("Failed to start PAC server after retries")
 
     def update_domains(self, blocked_domains):
         PACRequestHandler.blocked_domains = blocked_domains
@@ -203,9 +212,10 @@ class Blocker:
         self.pac_server.start(domains)
         self.pac_server.update_domains(domains)
         try:
+            pac_url_with_version = f"{PAC_URL}?t={int(time.time())}"
             reg_key = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, PAC_URL)
+                winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url_with_version)
             refresh_wininet()
             return True
         except Exception as e:
